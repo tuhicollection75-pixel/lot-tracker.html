@@ -765,6 +765,15 @@ function renderDidYouMean(box, partials, onPick){
     partials.slice(0,12).map(v=>`<button class="btn btn-ghost btn-sm btn-block" data-pick="${v}" style="margin-top:6px;">${v}</button>`).join('');
   box.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>onPick(b.dataset.pick));
 }
+// A lot already sitting inside a PENDING (not yet confirmed) slip for a given
+// process can't be added to another new slip for that same process — it has
+// to be confirmed or rejected first, so the same pieces never get claimed twice.
+async function getLotIdsPendingFor(collectionRef){
+  const snap = await collectionRef.where('status','==','pending').get();
+  const ids = new Set();
+  snap.docs.forEach(d=>{ (d.data().lotRefs||[]).forEach(x=>ids.add(x.lotId)); });
+  return ids;
+}
 // For the live availability-aware search bars (send-to-washing / receive-at-washing /
 // deposit): if no exact match, suggest sort/lot numbers among ELIGIBLE lots that
 // contain the typed text, same Excel-finder feel as Sort/Lot finder.
@@ -1111,14 +1120,16 @@ document.getElementById('transferSearch').addEventListener('input', async (e)=>{
   const q = e.target.value.trim();
   const box = document.getElementById('transferSearchResults'); box.innerHTML='';
   if(!q) return;
-  const [bySort, byLot] = await Promise.all([
+  const [bySort, byLot, pendingLotIds] = await Promise.all([
     LOTS.where('sortNumber','==',q).get(),
-    LOTS.where('lotNumber','==',q).get()
+    LOTS.where('lotNumber','==',q).get(),
+    getLotIdsPendingFor(TRANSFERS)
   ]);
   const map = {}; [...bySort.docs, ...byLot.docs].forEach(d=>map[d.id]=d);
   const results = Object.values(map).filter(d=>{
     const r = d.data();
     if(r.status==='rejected') return false;
+    if(pendingLotIds.has(d.id)) return false;
     const already = transferBatch.find(x=>x.id===d.id);
     const claimed = already ? already.qty : 0;
     return (r.pieces - (r.sentToWashing||0) - claimed) > 0;
@@ -1198,14 +1209,16 @@ document.getElementById('washReceiveSearch').addEventListener('input', async (e)
   const q = e.target.value.trim();
   const box = document.getElementById('washReceiveSearchResults'); box.innerHTML='';
   if(!q) return;
-  const [bySort, byLot] = await Promise.all([
+  const [bySort, byLot, pendingLotIds] = await Promise.all([
     LOTS.where('sortNumber','==',q).get(),
-    LOTS.where('lotNumber','==',q).get()
+    LOTS.where('lotNumber','==',q).get(),
+    getLotIdsPendingFor(WASHING_RECEIPTS)
   ]);
   const map = {}; [...bySort.docs, ...byLot.docs].forEach(d=>map[d.id]=d);
   const results = Object.values(map).filter(d=>{
     const r = d.data();
     if(r.status==='rejected') return false;
+    if(pendingLotIds.has(d.id)) return false;
     const already = washReceiveBatch.find(x=>x.id===d.id);
     const claimed = already ? already.qty : 0;
     return ((r.sentToWashing||0) - (r.receivedAtWashing||0) - claimed) > 0;
@@ -1280,14 +1293,16 @@ document.getElementById('depositSearch').addEventListener('input', async (e)=>{
   const q = e.target.value.trim();
   const box = document.getElementById('depositSearchResults'); box.innerHTML='';
   if(!q) return;
-  const [bySort, byLot] = await Promise.all([
+  const [bySort, byLot, pendingLotIds] = await Promise.all([
     LOTS.where('sortNumber','==',q).get(),
-    LOTS.where('lotNumber','==',q).get()
+    LOTS.where('lotNumber','==',q).get(),
+    getLotIdsPendingFor(DEPOSITS)
   ]);
   const map = {}; [...bySort.docs, ...byLot.docs].forEach(d=>map[d.id]=d);
   const results = Object.values(map).filter(d=>{
     const r = d.data();
     if(r.status==='rejected') return false;
+    if(pendingLotIds.has(d.id)) return false;
     const already = depositBatch.find(x=>x.id===d.id);
     const claimed = already ? already.qty : 0;
     return ((r.receivedAtWashing||0) - (r.deposited||0) - claimed) > 0;
@@ -2085,9 +2100,10 @@ document.getElementById('catchupAutoBtn').onclick = async ()=>{
   sources.sort((a,b)=> (a.ceiling||'').localeCompare(b.ceiling||'')); // most date-constrained money goes first
 
   const snap = await LOTS.get();
+  const pendingLotIds = await getLotIdsPendingFor(cfg.collectionRef);
   const outstanding = snap.docs
     .map(d=>({id:d.id, ...d.data()}))
-    .filter(lot=>lot.status!=='rejected' && (lot[cfg.counterField]||0) > 0 && (cfg.upstreamCapFn(lot) - (lot[cfg.counterField]||0)) > 0)
+    .filter(lot=>lot.status!=='rejected' && !pendingLotIds.has(lot.id) && (lot[cfg.counterField]||0) > 0 && (cfg.upstreamCapFn(lot) - (lot[cfg.counterField]||0)) > 0)
     .map(lot=>({lot, shortfall: cfg.upstreamCapFn(lot) - (lot[cfg.counterField]||0)}))
     .sort((a,b)=> (a.lot.stitchDate||'').localeCompare(b.lot.stitchDate||'') || a.lot.lotNumber.localeCompare(b.lot.lotNumber, undefined, {numeric:true}));
 
@@ -2132,10 +2148,10 @@ document.getElementById('catchupSearch').addEventListener('input', async (e)=>{
   box.innerHTML = '';
   if(!q || !catchupUnitKey) return;
   const cfg = PARTIAL_UNIT_CONFIG[catchupUnitKey];
-  const [bySort, byLot] = await Promise.all([ LOTS.where('sortNumber','==',q).get(), LOTS.where('lotNumber','==',q).get() ]);
+  const [bySort, byLot, pendingLotIds] = await Promise.all([ LOTS.where('sortNumber','==',q).get(), LOTS.where('lotNumber','==',q).get(), getLotIdsPendingFor(cfg.collectionRef) ]);
   const map = {}; [...bySort.docs, ...byLot.docs].forEach(d=>map[d.id]=d);
   const already = new Set(catchupBatch.map(x=>x.lotId));
-  const candidates = Object.values(map).filter(d=>!already.has(d.id) && d.data().status!=='rejected');
+  const candidates = Object.values(map).filter(d=>!already.has(d.id) && !pendingLotIds.has(d.id) && d.data().status!=='rejected');
   if(candidates.length===0){ box.innerHTML = '<div class="hint" style="padding:4px 0;">No matching lots.</div>'; return; }
   candidates.forEach(d=>{
     const lot = d.data();
